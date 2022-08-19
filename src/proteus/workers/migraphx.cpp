@@ -215,6 +215,9 @@ void MIGraphXWorker::doInit(RequestParameters* parameters) {
         prog_.get_parameter_shapes();  // program_parameter_shapes struct
       // auto input = param_shapes.names().front();  // "data", not currently
       // used
+      PROTEUS_LOG_INFO(logger,
+                       std::string("migraphx worker ASDF loaded ONNX model file ") +
+                         onnx_path.c_str());
 
       // Compile the model.  Hard-coded choices of offload_copy and gpu
       // target.
@@ -282,19 +285,23 @@ void MIGraphXWorker::doInit(RequestParameters* parameters) {
       std::to_string(input_shapes.size()));
   }
 
-  migraphx::shape sh = input_shapes["data"];
+  auto input_name = input_shapes.names()[0];
+
+  auto sh = input_shapes[input_name]; // migraphx::shape
+
+  // migraphx::shape sh = input_shapes["data"];
   auto length =
     sh.lengths();  // For resnet50, a vector of dimensions 1, 3, 224, 224
-  if (length.size() != 4) {
-    PROTEUS_LOG_INFO(logger,
-                     std::string("migraphx worker was passed a model with "
-                                 "unexpected number of input dimensions=") +
-                       std::to_string(length.size()));
-    throw std::invalid_argument(
-      std::string(("migraphx worker was passed a model with unexpected "
-                   "number of input dimensions=") +
-                  std::to_string(length.size())));
-  }
+  // if (length.size() != 4) {
+  //   PROTEUS_LOG_INFO(logger,
+  //                    std::string("migraphx worker was passed a model with "
+  //                                "unexpected number of input dimensions=") +
+  //                      std::to_string(length.size()));
+  //   throw std::invalid_argument(
+  //     std::string(("migraphx worker was passed a model with unexpected "
+  //                  "number of input dimensions=") +
+  //                 std::to_string(length.size())));
+  // }
 
   // Fetch the data types for input and output from the parsed/compiled model
   migraphx_shape_datatype_t input_type = sh.type();  // an enum
@@ -332,19 +339,28 @@ size_t MIGraphXWorker::doAllocate(size_t num) {
 #ifdef PROTEUS_ENABLE_LOGGING
   const auto& logger = this->getLogger();
 #endif
+  PROTEUS_LOG_INFO(logger, "MIGraphXWorker::doAllocate");
   //
   // Allocate
   //
-  constexpr auto kBufferNum = 2U;
+  constexpr auto kBufferNum = 4U;
   size_t buffer_num =
     static_cast<int>(num) == kNumBufferAuto ? kBufferNum : num;
-  // Allocate enough to hold 1 batch worth of images.
-  VectorBuffer::allocate(
-    this->input_buffers_, buffer_num,
-    1 * this->batch_size_ * image_height_ * image_width_ * image_channels_,
-    this->input_dt_);
-  VectorBuffer::allocate(this->output_buffers_, buffer_num,
-                         1 * this->batch_size_ * output_classes_, output_dt_);
+  // Allocate enough to hold buffer_num batches' worth of images.
+  // Extra batches allow server to hold more requests at one time
+  // todo:  this try/catch was observed to just get stuck when batch size
+  // is too big (approx. 56 for Yolov4 model); how to catch the error?
+  try{
+    VectorBuffer::allocate(
+      this->input_buffers_, buffer_num,
+      1 * this->batch_size_ * image_height_ * image_width_ * image_channels_,
+      this->input_dt_);
+    VectorBuffer::allocate(this->output_buffers_, buffer_num,
+                          1 * this->batch_size_ * output_classes_, output_dt_);
+  } catch (...) {
+      PROTEUS_LOG_ERROR(logger, std::string("MIGraphXWorker couldn't allocate buffer (batch size ") + std::to_string(batch_size_) + ")");
+      throw "MIGraphXWorker couldn't allocate buffer";
+  }
   PROTEUS_LOG_INFO(logger, std::string("MIGraphXWorker::doAllocate() added ") +
                              std::to_string(buffer_num) + " buffers");
 
@@ -440,6 +456,14 @@ void MIGraphXWorker::doRun(BatchPtrQueue* input_queue) {
       //
       // Run the inference
       //
+      std::string msg;
+      std::stringstream smsg(msg);
+for(auto asdf : param_shapes[input].lengths()){ 
+      smsg << " !!! in the worker " << asdf << ", " << this->batch_size_;
+}
+smsg << std::endl;
+PROTEUS_LOG_INFO(logger, smsg.str());
+
       PROTEUS_LOG_INFO(logger, "Beginning migraphx eval");
       std::chrono::time_point eval_tp =
         std::chrono::high_resolution_clock::now();
@@ -481,74 +505,105 @@ void MIGraphXWorker::doRun(BatchPtrQueue* input_queue) {
           //
           auto inputs =
             req0->getInputs();  // const std::vector<InferenceRequestInput>
+  smsg.str("");
+  for(auto a: inputs){
+    smsg << "input dimensions: ";
+    // PROTEUS_LOG_DEBUG(logger, "input dimensions: ");
+    auto sh = a.getShape();
+    for(auto ll : sh)
+      smsg << ll << ",  ";  // vector
+    smsg << "\n";
+  
+    PROTEUS_LOG_DEBUG(logger, smsg.str());
+  }
+
           auto outputs =
             req->getOutputs();  // one result vector for each request
           //
           // Transfer the migraphx results to output
           //
-          size_t result_size =
+          size_t result_size = //debug only
             migraphx_output
               .size();  // should be 1 item with items for each input, each
                         // input has 1000 (for resnet) categories
-          if (result_size != 1)
-            throw std::length_error(
-              "result count from migraphx call was not 1");
-          auto shape = migraphx_output[0].get_shape();
+          (void) result_size;
+          // if (result_size != 1)
+          //   throw std::length_error(
+          //     "result count from migraphx call was not 1");
+smsg.str("");
+smsg << "asdf debug, output size is " << outputs.size() << " or "  << result_size << std::endl;
+PROTEUS_LOG_INFO(logger, smsg.str());
 
-          // recast the migraphx output from a blob to an array of
-          // this->output_dt_
-          auto lengths = shape.lengths();
-          size_t num_results = std::accumulate(
-            lengths.begin() + 1, lengths.end(), 1, std::multiplies<size_t>());
-          // size of each result array, bytes
-          size_t size_of_result = num_results * output_dt_.size();
-          // for each image in the request, there should be 1 vector of 1000
-          // values
-          PROTEUS_LOG_DEBUG(logger, std::string("Request with ") +
-                                      std::to_string(req->getInputs().size()) +
-                                      " images");
+          for(size_t i = 0; i < result_size; i++)
+          {
+            // The migraphx return has 3 outputs for the Yolov4 model: migraphx_output
+            // These will all go into outputs, the buffer for returns to the client
+            auto this_output = migraphx_output[i];
+            auto shape = this_output.get_shape();
 
-          for (size_t k = 0;
-               k < req->getInputs().size() && input_index < batch_size_; k++) {
-            char* results =
-              migraphx_output[0].data() + (input_index++) * size_of_result;
-#define NDEBUG
-#ifndef NDEBUG
+            // recast the migraphx output from a blob to an array of type
+            // this->output_dt_
+            auto lengths = shape.lengths();
+
+            size_t num_results = std::accumulate(
+              lengths.begin() + 1, lengths.end(), 1, std::multiplies<size_t>());
+smsg.str("");
+            smsg <<"asdf result # " << i << "  result count " << num_results << std::endl;
+PROTEUS_LOG_INFO(logger, smsg.str());
+
+            // remove the 0'th dimension from lengths, which is the batch size
+            lengths.erase(lengths.begin());
+            // size of each result array, bytes
+            size_t size_of_result = num_results * output_dt_.size();
+            
+            PROTEUS_LOG_DEBUG(logger, std::string("Request with ") +
+                                        std::to_string(req->getInputs().size()) +
+                                        " inputs");
+
+            // todo: this is written to loop over multiple images in a single batch, not
+            // over multiple inputs in a single request.
+            // for (size_t k = 0;
+            //     k < req->getInputs().size() && input_index < batch_size_; k++) 
+                
             {
-              float* zresults = reinterpret_cast<float*>(results);
+              char* results =
+                this_output.data() + input_index * size_of_result;
 
-              // for debug  Compare this result with
-              //    values seen by client to verify output packet is correct.
-              float* myMax = std::max_element(zresults, zresults + num_results);
-              int answer = myMax - zresults;
-              std::cout << "Ok.  the top-ranked index is " << answer << " val. "
-                        << *myMax << std::endl;
-            }
-#endif
-            // the kserve specification for response output is at
-            // https://github.com/kserve/kserve/blob/master/docs/predict-api/v2/required_api.md#response-output
-            InferenceResponseOutput output;
-            output.setDatatype(output_dt_);
-            // todo:  use real indexes here
-            std::string output_name = outputs[0].getName();
-            if (output_name.empty()) {
-              output.setName(inputs[0].getName());
-            } else {
-              output.setName(output_name);
-            }
-            output.setShape({num_results});
-            output.setData(results);
+              // the kserve specification for response output is at
+              // https://github.com/kserve/kserve/blob/master/docs/predict-api/v2/required_api.md#response-output
+              InferenceResponseOutput output;
+              output.setDatatype(output_dt_);
+              
+              // The outputs buffer in the InferenceRequest is not used or enforced at the time of writing this,
+              // so give the output a default name if necessary.
+              std::string output_name{""};
+              if(i < outputs.size())
+                output_name = outputs[i].getName();
+              if (output_name.empty()) {
+                output.setName(inputs[0].getName());
+              } else {
+                output.setName(output_name);
+              }
+              output.setShape(lengths);
+              output.setData(results);
 
-            // Copy migraphx results to a buffer and add to output
-            auto buffer = std::make_shared<std::vector<std::byte>>();
-            buffer->resize(size_of_result);
-            memcpy(&((*buffer)[0]), results, size_of_result);
-            auto my_data_cast =
-              std::reinterpret_pointer_cast<std::byte>(buffer);
-            output.setData(std::move(my_data_cast));
-            resp.addOutput(output);
+              // Copy migraphx results to a buffer and add to output
+              auto buffer = std::make_shared<std::vector<std::byte>>();
+              buffer->resize(size_of_result);
+              memcpy(&((*buffer)[0]), results, size_of_result);
+              auto my_data_cast =
+                std::reinterpret_pointer_cast<std::byte>(buffer);
+              output.setData(std::move(my_data_cast));
+
+              PROTEUS_LOG_DEBUG(logger, (std::string("Adding an output")));
+              smsg.str("dimensions: ");
+              for(auto a: lengths)
+                smsg << a << "  ";
+              PROTEUS_LOG_DEBUG(logger, smsg.str());
+              resp.addOutput(output);
+            }
           }
-
+          input_index++;
           // respond back to the client
           req->runCallbackOnce(resp);
 #ifdef PROTEUS_ENABLE_METRICS

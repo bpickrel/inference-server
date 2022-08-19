@@ -66,6 +66,7 @@ def ImageInferenceRequest(images, asTensor=False):
         images = [images]
     request = predict_api.InferenceRequest()
     for index, image in enumerate(images):
+        # TODO: update this method.  It's no longer legal to put multiple image tensors in one request.
         input_n = predict_api.InferenceRequestInput()
         input_n.name = f"input{index}"
         if isinstance(image, str):
